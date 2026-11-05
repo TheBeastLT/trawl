@@ -449,7 +449,10 @@ async function scrapeWithinBudget(
     !explicitProxy &&
     !deps.proxyPool &&
     !session?.proxyId &&
-    (!req.method || req.method === "GET" || req.method === "HEAD") &&
+    (!req.method ||
+      req.method === "GET" ||
+      req.method === "HEAD" ||
+      (req.method === "POST" && req.httpReplay === true)) &&
     !req.screenshot &&
     !req.consoleLogs &&
     !req.networkLogs &&

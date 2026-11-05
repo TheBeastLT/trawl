@@ -16,7 +16,7 @@ This is a cookie cache, not a page-content cache. Each request fetches the targe
 
 Before an ordinary HTTP request, TRAWL checks whether the saved session can be replayed:
 
-- The request is GET or HEAD and permits Tier 1.
+- The request is GET or HEAD, or a POST that sets `httpReplay: true`, and permits Tier 1.
 - The connection is direct: no explicit request proxy or configured datacenter proxy pool.
 - TLS verification is enabled.
 - The entry contains the browser's User-Agent, valid scoped cookies and provenance for the exact

@@ -269,6 +269,10 @@ describe("HTTP clearance fallback", () => {
 
   test.each([
     { name: "POST", request: { method: "POST", headers: { "Content-Type": "text/plain" }, body: "body" } },
+    {
+      name: "httpReplay on PUT",
+      request: { method: "PUT", httpReplay: true, headers: { "Content-Type": "text/plain" }, body: "body" },
+    },
     { name: "skipHttp", request: { skipHttp: true } },
     { name: "explicit proxy", request: { proxy: "http://proxy.test:8080" } },
     { name: "screenshot", request: { screenshot: true } },
@@ -429,3 +433,133 @@ test.each(["cf_clearance", "techaro.lol-anubis-auth"])(
     expect(seen[1]).toEqual({ cookie: `${name}=verified`, agent: "browser-agent" })
   },
 )
+
+describe("HTTP clearance replay for opted-in POST requests", () => {
+  const form = { method: "POST" as const, headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+
+  test("hands the shared jar to Tier 1 only when the POST opts in", async () => {
+    const replays: boolean[] = []
+    const deps: OrchestratorDeps = {
+      acquireBrowser: async () => ({ fingerprint: { userAgent: "browser-agent" } }) as BrowserHandle,
+      releaseBrowser: () => {},
+      loadSession: async () => cached(),
+      saveSession: async () => {},
+      invalidateSession: async () => {},
+    }
+    const runners = {
+      tier1: async (...args: Parameters<typeof runTier1>) => {
+        replays.push(Boolean(args[9]))
+        return { tier: 1 as const, status: "needs-js" as const, durationMs: 1 }
+      },
+      tier3: async () => ({
+        tier: 3 as const,
+        status: "success" as const,
+        durationMs: 1,
+        html: "<html><body>Rendered</body></html>",
+        effectiveUrl: "https://example.test/",
+      }),
+    }
+    await scrape({ url: "https://example.test/", ...form, body: "a=1" }, deps, runners)
+    await scrape({ url: "https://example.test/", ...form, body: "a=1", httpReplay: true }, deps, runners)
+    await scrape({ url: "https://example.test/", ...form, body: "a=1", httpReplay: false }, deps, runners)
+    expect(replays).toEqual([false, true, false])
+  })
+
+  test("replays clearance for an opted-in POST with cookies set by an earlier reply", async () => {
+    const seen: { method: string; cookie: string | null; body: string }[] = []
+    server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const cookie = request.headers.get("cookie")
+        seen.push({ method: request.method, cookie, body: await request.text() })
+        if (!cookie?.includes("cf_clearance=verified")) {
+          return new Response("<html><title>Just a moment...</title><script>window._cf_chl_opt={}</script></html>", {
+            status: 403,
+            headers: { "content-type": "text/html" },
+          })
+        }
+        if (new URL(request.url).pathname === "/page") {
+          return new Response("<html><body>Page</body></html>", {
+            headers: { "content-type": "text/html", "set-cookie": "sid=abc123; Path=/; HttpOnly" },
+          })
+        }
+        if (request.method !== "POST" || !cookie.includes("sid=abc123")) {
+          return new Response('{"error":"Invalid session"}', { headers: { "content-type": "application/json" } })
+        }
+        return new Response('{"result":"ok"}', {
+          headers: { "content-type": "application/json" },
+        })
+      },
+    })
+    const origin = `http://127.0.0.1:${server.port}`
+    let saved: SessionData | undefined = { ...cached([clearance("127.0.0.1", { secure: false })]), httpOrigin: origin }
+    const deps: OrchestratorDeps = {
+      acquireBrowser: async () => {
+        throw new Error("Unexpected browser checkout")
+      },
+      releaseBrowser: () => {},
+      loadSession: async () => saved,
+      saveSession: async (_domain, data) => {
+        saved = data
+      },
+      invalidateSession: async () => {
+        saved = undefined
+      },
+    }
+    const page = await scrape({ url: `${origin}/page`, maxTier: 1 }, deps)
+    expect(page).toMatchObject({ tier: 1, sessionCached: true })
+    expect(saved?.cookies.map((cookie) => cookie.name)).toEqual(["cf_clearance", "sid"])
+    const action = await scrape(
+      { url: `${origin}/api/action`, ...form, body: "item=1", httpReplay: true, maxTier: 1 },
+      deps,
+    )
+    expect(action).toMatchObject({ tier: 1, sessionCached: true, statusCode: 200 })
+    expect(JSON.parse(action.html)).toMatchObject({ result: "ok" })
+    expect(seen).toEqual([
+      { method: "GET", cookie: "cf_clearance=verified", body: "" },
+      { method: "POST", cookie: "cf_clearance=verified; sid=abc123", body: "item=1" },
+    ])
+    expect(saved?.cookies.map((cookie) => cookie.name)).toEqual(["cf_clearance", "sid"])
+  })
+
+  test("returns a rejected opted-in POST replay to the browser tiers", async () => {
+    server = Bun.serve({
+      port: 0,
+      fetch: () =>
+        new Response("<html><title>Just a moment...</title><script>window._cf_chl_opt={}</script></html>", {
+          status: 403,
+          headers: { "content-type": "text/html" },
+        }),
+    })
+    const origin = `http://127.0.0.1:${server.port}`
+    let checkouts = 0
+    const result = await scrape(
+      { url: `${origin}/api`, ...form, body: "item=1", httpReplay: true, maxTier: 2 },
+      {
+        acquireBrowser: async () => {
+          checkouts++
+          return {} as BrowserHandle
+        },
+        releaseBrowser: () => {},
+        loadSession: async () => ({ ...cached([clearance("127.0.0.1", { secure: false })]), httpOrigin: origin }),
+        saveSession: async () => {},
+        invalidateSession: async () => {},
+      },
+      {
+        tier2: async () => ({
+          tier: 2,
+          status: "success",
+          durationMs: 1,
+          html: '{"result":"ok"}',
+          effectiveUrl: `${origin}/api`,
+        }),
+      },
+    )
+    expect(result.tier).toBe(2)
+    expect(result.timings.map((timing) => [timing.status, timing.reason])).toEqual([
+      ["needs-js", "cloudflare-challenge"],
+      ["success", undefined],
+    ])
+    expect(checkouts).toBe(1)
+  })
+})

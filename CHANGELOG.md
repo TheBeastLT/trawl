@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add the opt-in `httpReplay` request flag so a `POST` can reuse the shared HTTP clearance jar in Tier 1, carrying cookies set by earlier replayed requests of the same origin; the default keeps every `POST` on the browser path.
+
 ## [1.10.0] - 2026-11-03
 
 ### Security
